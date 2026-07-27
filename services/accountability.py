@@ -59,18 +59,57 @@ def _scored_rows(ctx, symbol: str | None = None, horizon: str | None = None,
     return rows
 
 
-def _empty_note(ctx) -> dict:
-    counts = ctx.counts()
-    return {
+def _empty_note(ctx, symbol: str | None = None, horizon: str | None = None) -> dict:
+    """What to return when the filtered record is empty.
+
+    Two things this must never do, both of which it used to. It must not say "nothing has been
+    scored" when the answer is only "nothing matching *your* filter" — with one symbol graded and
+    another not, that sentence is simply false to the caller who asked about the second. And it must
+    not answer a paid call with prose about how to verify a record that it declines to show; a buyer
+    who asked for a symbol's track record and received the coverage policy has been charged for
+    documentation. So the empty case returns the forecasts that *are* committed for that filter —
+    ids, digests, the anchor that put each on chain, and the timestamp each one grades at.
+    """
+    scored_total = len(_scored_rows(ctx))
+    pending = ctx.pending(symbol, horizon)
+    asked = {k: v for k, v in (("symbol", symbol), ("horizon", horizon)) if v}
+
+    if scored_total == 0:
+        why = ("No forecast has been scored yet, for any symbol. The ledger is live and forecasts "
+               "are committed on X Layer, but no window has closed and been graded.")
+    else:
+        where = " and ".join(f"{k}={v}" for k, v in asked.items()) or "this filter"
+        why = (f"{scored_total} forecast(s) have been scored, but none match {where}. The record "
+               f"exists; it does not yet cover what you asked for.")
+
+    available: dict[str, list] = {}
+    if scored_total:
+        every = _scored_rows(ctx)
+        available = {
+            "symbols": sorted({r["issued"].get("symbol") for r in every if r["issued"].get("symbol")}),
+            "horizons": sorted({r["issued"].get("horizon") for r in every if r["issued"].get("horizon")}),
+        }
+
+    out = {
         "scored_forecasts": 0,
-        "note": ("No forecast has been scored yet. The ledger is live and forecasts are being "
-                 "committed on X Layer, but none of their windows have closed and been graded. "
-                 "This page publishes empty rather than showing a backtest — Kronos was pre-trained "
-                 "across 45 exchanges to an unpublished cutoff, so any historical evaluation risks "
-                 "scoring it on its own training data. The record starts here and accumulates "
-                 "forward."),
-        "ledger": counts,
+        "filter": asked or None,
+        "note": why + (
+            " Horos publishes empty rather than a backtest — Kronos was pre-trained across 45 "
+            "exchanges to an unpublished cutoff, so any historical evaluation risks scoring it on "
+            "its own training data. The record starts at first commit and accumulates forward."),
+        # The substance of the answer when there are no scores yet. Each row was hashed and signed
+        # before its window opened, so it can be checked now and graded later against this same id.
+        "pending_forecasts": pending,
+        "pending_count": len(pending),
+        "next_grades_at": pending[0]["grades_after"] if pending else None,
+        "ledger": ctx.counts(),
     }
+    if available:
+        out["record_available_for"] = available
+    if not pending:
+        out["pending_note"] = ("nothing is currently committed for this filter either. Coverage is "
+                               "listed under 'coverage' — a symbol outside it is never forecast.")
+    return out
 
 
 # ── the record ───────────────────────────────────────────────────────────────────────────────────
@@ -117,7 +156,7 @@ def scorecard(inp: dict, ctx) -> dict:
                       "Nothing here depends on trusting Horos."),
     }
     if not rows:
-        return {**base, **_empty_note(ctx)}
+        return {**base, **_empty_note(ctx, inp.get("symbol"), inp.get("horizon"))}
 
     overall = aggregate([r["scores"] for r in rows])
     by_symbol: dict[str, dict] = {}
@@ -172,7 +211,7 @@ def scorecard(inp: dict, ctx) -> dict:
 def scorecard_regime(inp: dict, ctx) -> dict:
     rows = _scored_rows(ctx, inp.get("symbol"))
     if not rows:
-        return {**_empty_note(ctx),
+        return {**_empty_note(ctx, inp.get("symbol")),
                 "note_regime": "regime breakdown needs scored forecasts to break down."}
 
     # Regime from the dispersion the model itself implied at issue time — known before the outcome.
@@ -272,14 +311,28 @@ def forecast_reliability(inp: dict, ctx) -> dict:
     symbol = inp.get("symbol")
     rows = _scored_rows(ctx, symbol)
     if not rows:
+        empty = _empty_note(ctx, symbol)
+        scored_elsewhere = empty.get("record_available_for") or {}
         return {
             "symbol": symbol,
             "verdict": "no_record_yet",
-            "recommendation": ("No forecast has been scored yet, so there is no evidence either way "
-                               "about this model's reliability. Horos publishes no backtest because "
-                               "the model's pre-training contaminates one. Treat the forecast bands "
-                               "as the model's own claim until the record fills — check back, or "
-                               "read the free scorecard endpoint."),
+            # Says "for this symbol", not "at all" — the previous wording claimed nothing had ever
+            # been scored even when another symbol's record was already published.
+            "recommendation": (
+                f"There is no scored record for {symbol or 'any symbol'} yet, so no claim is made "
+                f"either way about reliability here. Horos publishes no backtest because the "
+                f"model's pre-training contaminates one. Treat the forecast bands as the model's "
+                f"own claim until the record fills."
+                + (f" Scored coverage does exist for: {', '.join(scored_elsewhere.get('symbols', []))}."
+                   if scored_elsewhere.get("symbols") else "")
+                + (f" {empty['pending_count']} forecast(s) are already committed and hashed for this "
+                   f"filter; the first grades at {empty['next_grades_at']}."
+                   if empty.get("pending_count") else "")),
+            "pending_forecasts": empty["pending_forecasts"],
+            "pending_count": empty["pending_count"],
+            "next_grades_at": empty["next_grades_at"],
+            "record_available_for": scored_elsewhere or None,
+            "free_alternative": "the same record is free and unauthenticated at /scorecard",
             "ledger": ctx.counts(),
         }
 
@@ -566,10 +619,21 @@ def leaderboard(inp: dict, ctx) -> dict:
             by_label.setdefault(e.body.get("label", "unknown"), []).append(e.body.get("scores", {}))
 
     if not by_label:
+        # Scoped to the filter. Saying "nobody has a scored forecast" while another symbol's table
+        # is already populated would be false to whoever asked about this one.
+        anywhere = len(_scored_rows(ctx))
+        empty = _empty_note(ctx, symbol)
         return {
             "participants": [],
-            "note": ("Nobody has a scored forecast in this ledger yet — including Horos. The table "
-                     "fills as windows close and forecasts are graded."),
+            "filter": {"symbol": symbol} if symbol else None,
+            "note": (f"No participant has a scored forecast for {symbol} yet — including Horos."
+                     if symbol and anywhere else
+                     "Nobody has a scored forecast in this ledger yet — including Horos.")
+                    + " The table fills as windows close and forecasts are graded.",
+            "record_available_for": empty.get("record_available_for"),
+            "pending_forecasts": empty["pending_forecasts"],
+            "pending_count": empty["pending_count"],
+            "next_grades_at": empty["next_grades_at"],
             "how_to_enter": _how_to_enter(),
             "ledger": ctx.counts(),
         }

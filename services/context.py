@@ -110,6 +110,37 @@ class Context:
                 and r.get("window") and r["window"]["close"] <= now]
         return max(rows, key=lambda r: r["seq"]) if rows else None
 
+    def pending(self, symbol: str | None = None, horizon: str | None = None) -> list[dict]:
+        """Committed and hashed, but not yet graded. Voided excluded, soonest to grade first.
+
+        The record's answer for a symbol whose windows have not closed. These rows are already
+        checkable — the distribution was hashed and signed before the window opened and the anchor
+        put that hash on chain — so they are evidence, not a placeholder for it.
+        """
+        idx = self._fresh_index()
+        rows = []
+        for row in idx["issued"].values():
+            fid = row["forecast_id"]
+            if fid in idx["scored"] or fid in idx["voided"]:
+                continue
+            body = row["body"]
+            if symbol and body.get("symbol") != symbol:
+                continue
+            if horizon and body.get("horizon") != horizon:
+                continue
+            rows.append({
+                "forecast_id": fid,
+                "symbol": body.get("symbol"),
+                "horizon": body.get("horizon"),
+                "issued_at": row["issued_at"],
+                "grades_after": (row.get("window") or {}).get("close"),
+                "distribution_sha256": body.get("distribution_sha256"),
+                "model_version": body.get("model_version"),
+                "anchor": row.get("anchor"),
+            })
+        rows.sort(key=lambda r: r["grades_after"] or "")
+        return rows
+
     def anchors(self) -> list[dict]:
         return self._fresh_index()["anchors"]
 
