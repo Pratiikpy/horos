@@ -42,6 +42,14 @@ from services.registry import REGISTRY, ServiceError, envelope
 from x402_bridge import (PAYMENT_REQUIRED_HEADER, PAYMENT_RESPONSE_HEADER, build_challenge,
                          malformed_payment, verify_payment)
 
+# MarketDataError covers two different situations and they deserve different status codes: something
+# upstream failed, or the caller asked for something we do not serve. Only the second is the caller's
+# to fix, and telling them to retry a symbol that does not exist wastes their money and their time.
+_CALLER_INPUT_CODES = frozenset({
+    "bad_timeframe", "bad_limit", "unknown_exchange", "unsupported", "window_open",
+    "unknown_symbol",
+})
+
 log = logging.getLogger("horos")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
@@ -360,10 +368,21 @@ async def paid_endpoint(endpoint: str, request: Request,
                             content={**e.as_dict(), "endpoint": endpoint,
                                      "example_request": {"input": svc.input_contract()["example"]}})
     except MarketDataError as e:
-        return JSONResponse(status_code=502, headers=_headers_for(payment),
-                            content={**e.as_dict(), "endpoint": endpoint,
-                                     "note": "an upstream market data source failed. This is "
-                                             "reported rather than answered around."})
+        # 502 says "our upstream broke, try again"; 422 says "that input is not one we serve". Both
+        # arrived here as 502, so asking for a symbol we do not cover, or a timeframe like '9y', told
+        # the caller to retry something that can never succeed — and blamed the exchange for their
+        # typo. The distinction is already carried on the error's own code.
+        caller_error = e.code in _CALLER_INPUT_CODES
+        note = ("that input is not one this service can serve. Retrying will not change it — see "
+                "'supported' or GET /services for what is covered."
+                if caller_error else
+                "an upstream market data source failed. This is reported rather than answered "
+                "around, and is worth retrying.")
+        return JSONResponse(status_code=422 if caller_error else 502,
+                            headers=_headers_for(payment),
+                            content={**e.as_dict(), "endpoint": endpoint, "note": note,
+                                     **({"example_request": {"input": svc.input_contract()["example"]}}
+                                        if caller_error else {})})
     except Exception as e:                                           # noqa: BLE001
         # Never a bare 500. A typed code and the actual exception, because a caller who has paid
         # deserves to know what broke.

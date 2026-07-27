@@ -44,6 +44,13 @@ MAX_CANDLES = 5_000          # a paid call cannot be made to pull unbounded hist
 MAX_ORDERBOOK_DEPTH = 400    # OKX's own ceiling: `request['sz'] = limit  # max 400`
 
 
+# ccxt exception names that mean "the caller asked for something that does not exist" rather than
+# "the venue is having trouble". Matched by name so ccxt stays an optional import.
+_CALLER_SYMBOL_ERRORS = frozenset({
+    "BadSymbol", "BadRequest", "ArgumentsRequired", "NotSupported",
+})
+
+
 class MarketDataError(RuntimeError):
     """A named data failure. Carries what was being fetched so the caller can act on it."""
 
@@ -249,6 +256,16 @@ class MarketData:
             try:
                 page = client.fetch_ohlcv(symbol, timeframe, since=since, limit=per_call)
             except Exception as e:                                       # noqa: BLE001
+                # ccxt reports "this symbol does not exist" and "the exchange is unreachable" through
+                # the same call, and collapsing both into source_error made a typo look like an
+                # outage: the caller was told the venue refused them and to try again, for a symbol
+                # that will never exist. BadSymbol and friends are the caller's to fix; a network
+                # error is ours to report and worth retrying.
+                if type(e).__name__ in _CALLER_SYMBOL_ERRORS:
+                    raise MarketDataError(
+                        f"{exchange} does not list {symbol}. Check the symbol against GET /services, "
+                        f"which names every market this service covers.",
+                        source=exchange, symbol=symbol, code="unknown_symbol") from e
                 raise MarketDataError(
                     f"{exchange} refused the candle request for {symbol} {timeframe}: "
                     f"{type(e).__name__}: {e}",
