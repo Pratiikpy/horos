@@ -146,8 +146,25 @@ def _scored(ctx) -> list[dict]:
 
 
 def _head() -> str:
-    return (f"<title>{SERVICE_NAME} — the record</title>\n<style>{CSS}</style>\n"
-            f'<div class="wrap">')
+    """A complete document, not a fragment.
+
+    This page used to begin at `<title>` — no doctype, no `<html>`, no `<head>`, and no viewport
+    meta. Browsers forgive the missing tags, but the missing viewport is not cosmetic: without it a
+    phone lays the page out at ~980px and then zooms out to fit, so the coverage table — the part
+    that carries the actual argument — arrives unreadable. The record is the product, and it has to
+    be legible on the device someone happens to be holding.
+
+    No doctype also means quirks mode, where the box model differs from the one this CSS was written
+    against.
+    """
+    return (
+        '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
+        f"<title>{SERVICE_NAME} — the record</title>\n"
+        '<meta name="description" content="Every forecast Horos issued, scored against what the '
+        'market actually did. Generated from a hash-chained ledger, losses included.">\n'
+        f"<style>{CSS}</style>\n</head>\n<body>\n"
+        '<div class="wrap">')
 
 
 def _header(counts: dict, anchors: list, ok: bool, problems: list) -> str:
@@ -428,4 +445,6 @@ def _footer() -> str:
 <script>
 // Respect an explicit theme choice if the host page sets one; otherwise follow the system.
 (function(){{var t=document.documentElement.getAttribute('data-theme');if(!t){{}}}})();
-</script>"""
+</script>
+</body>
+</html>"""

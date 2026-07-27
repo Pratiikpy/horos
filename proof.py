@@ -139,7 +139,15 @@ def page() -> str:
     receipts = sum(1 for r in rows if r.get("receipt_verifies"))
     spent = sum(float(r["price"]) for r in rows)
 
-    out = [f"<title>Horos — proof</title>", f"<style>{CSS}</style>", '<div class="wrap">']
+    # A complete document. Without the viewport meta a phone lays this out at ~980px and zooms out,
+    # which turns the per-service evidence table into something unreadable on the device a reviewer
+    # is most likely holding. Without a doctype the browser also drops into quirks mode.
+    out = ['<!doctype html>', '<html lang="en">', '<head>', '<meta charset="utf-8">',
+           '<meta name="viewport" content="width=device-width,initial-scale=1">',
+           "<title>Horos — proof</title>",
+           '<meta name="description" content="Every Horos service bought with real USD₮0 on '
+           'X Layer, and the answer it returned.">',
+           f"<style>{CSS}</style>", '</head>', '<body>', '<div class="wrap">']
     out.append(f"""
 <header>
   <div class="brand"><h1>Horos</h1><span class="tag">Marked before the outcome.</span></div>
@@ -322,7 +330,9 @@ def _footer() -> str:
   <a href="/verify">check a receipt</a></p>
   <p>No buy, sell or hold. No direction calls. No backtested performance. Measurement with its
   uncertainty attached, and a public record of how often that uncertainty was right.</p>
-</footer></div>"""
+</footer></div>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":
