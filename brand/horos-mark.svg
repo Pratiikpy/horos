@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000" viewBox="0 0 1000 1000">
+  <defs>
+    <linearGradient id="ground" x1="0.15" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#eaddc3"/>
+      <stop offset="1" stop-color="#c9b691"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Filled to all four corners with hard edges. OKX rejects a backgroundless floating logo. -->
+  <rect width="1000" height="1000" fill="url(#ground)"/>
+
+  <!-- The earth the marker is set into. A horos was planted in the ground it spoke about. -->
+  <rect x="0" y="856" width="1000" height="144" fill="#b3a07c"/>
+
+  <path d="M 408 172 L 605 185 L 610 201 L 652 856 L 348 856 L 390 195 Z" fill="#1c1811"/>
+  <path d="M 356 400 L 644 400 L 647 444 L 353 444 Z" fill="#c2571f"/>
+</svg>

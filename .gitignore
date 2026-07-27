@@ -1,0 +1,17 @@
+# Secrets — never committed. The signing key, the anchoring key and the AWS key all live here.
+.secrets/
+.env
+*.pem
+*.key
+
+# Runtime state. The ledger is public and served at /ledger, but it is data, not source —
+# committing it would put a moving file in every diff.
+.data/
+.models/
+
+# Local scratch
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
