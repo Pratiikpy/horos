@@ -42,6 +42,35 @@ PLANNABLE = [
 
 MAX_STEPS = 8
 
+# Punctuation that does not survive the trip to the buyer.
+#
+# A delivered A2A file was read back and found to contain the literal characters "â€”" where an em
+# dash had been written: the UTF-8 bytes were decoded as cp1252 somewhere between this service and
+# the file the buyer opens, then re-encoded. The buyer sees corrupted text in the artifact they paid
+# for. The encoding step is not ours to fix, so the durable answer is to stop emitting characters
+# that depend on it being right. Asking the model for ASCII is not enough on its own — it will
+# occasionally reach for a nicer dash — so the substitution is applied to what it returns.
+_ASCII_PUNCTUATION = {
+    "—": "--", "–": "-", "‒": "-", "−": "-",
+    "‘": "'", "’": "'", "‚": "'",
+    "“": '"', "”": '"', "„": '"',
+    "…": "...", " ": " ", " ": " ", " ": " ",
+    "×": "x", "→": "->", "≤": "<=", "≥": ">=",
+}
+
+
+def to_ascii_punctuation(value):
+    """Replace typographic punctuation with ASCII, recursively through the brief."""
+    if isinstance(value, str):
+        for bad, good in _ASCII_PUNCTUATION.items():
+            value = value.replace(bad, good)
+        return value
+    if isinstance(value, dict):
+        return {k: to_ascii_punctuation(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_ascii_punctuation(v) for v in value]
+    return value
+
 PLANNER_SYSTEM = """You plan analysis for Horos, a market-analysis agent.
 
 You do NOT produce numbers, prices, forecasts or opinions. You choose which of Horos's services to
@@ -74,6 +103,9 @@ Absolute rules:
 - Where a result carries a caveat, warning or "not_computed" entry, surface it rather than omitting
   it. Bad news comes first.
 - Plain professional English. No hype, no filler, no bullet-point padding.
+- ASCII punctuation only: use "--" not an em dash, straight quotes not curly ones, "..." not an
+  ellipsis character. The brief is written to a plain text file for the buyer, and non-ASCII
+  punctuation has been observed arriving corrupted in a delivered file.
 
 Return ONLY a JSON object:
 {"summary": "2-4 sentences answering the question directly",
@@ -204,6 +236,10 @@ def analysis_task(inp: dict, ctx) -> dict:
             required=["summary", "findings"], max_tokens=2500, deadline=deadline)
     except LLMError as e:
         brief_error = str(e)
+
+    # Only the prose is normalised. `raw_results` carries the services' own output and is what the
+    # brief is checked against, so rewriting characters inside it would break that correspondence.
+    brief = to_ascii_punctuation(brief)
 
     return {
         "request": request,
