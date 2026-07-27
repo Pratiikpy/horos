@@ -40,7 +40,7 @@ from services import a2a, accountability, forecast, market, metrics, risk  # noq
 from services.context import Context
 from services.registry import REGISTRY, ServiceError, envelope
 from x402_bridge import (PAYMENT_REQUIRED_HEADER, PAYMENT_RESPONSE_HEADER, build_challenge,
-                         verify_payment)
+                         malformed_payment, verify_payment)
 
 log = logging.getLogger("horos")
 logging.basicConfig(level=logging.INFO,
@@ -290,6 +290,51 @@ async def paid_endpoint(endpoint: str, request: Request,
             "expected": "base64 of the x402 v2 payment payload from your wallet. Call this "
                         "endpoint with no payment header at all to get a challenge to sign."})
 
+    # An unreadable header is answered first. A caller with both a broken header and a thin body has
+    # two problems, and "your header is malformed" is the one that explains why retrying the payment
+    # will not help — so it must not be masked by the input check below.
+    broken = malformed_payment(authorization)
+    if broken is not None:
+        return JSONResponse(status_code=400, content={
+            "error": broken.detail, "code": broken.code, "field": broken.field,
+            "endpoint": endpoint,
+            "expected": "base64 of the x402 v2 payment payload from your wallet. Call this "
+                        "endpoint with no payment header to get a challenge to sign."})
+
+    # Read and check the input *before* settling. Payment used to clear first, so a caller who left
+    # out a required field was charged and handed an error — a fee on their statement and no work
+    # done. The status codes below are deliberately identical to what this endpoint returned before
+    # (200 with the contract for an empty body, 422 for a partial one); the only change is that the
+    # money no longer moves. Keeping the codes fixed means no client and no listing check can notice
+    # anything except that they stopped being billed for it.
+    try:
+        payload = await request.json()
+    except Exception:                                                # noqa: BLE001
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    node_input = payload.get("input") if isinstance(payload.get("input"), dict) else payload
+    node_input = {k: v for k, v in node_input.items() if k not in ("options", "idempotency_key")}
+
+    missing = [f for f in svc.required if node_input.get(f) in (None, "")]
+    if missing:
+        contract = svc.input_contract()
+        unbilled = ("Nothing was billed for this call — your authorization was not settled. Send "
+                    "the example above with payment to get the real result.")
+        if not node_input:
+            return JSONResponse(status_code=200, content={
+                "endpoint": endpoint, "status": "input_required",
+                "what_this_does": svc.summary, "returns": svc.returns, "depth": svc.depth,
+                "required": contract["required"], "properties": contract["properties"],
+                "example_request": {"input": contract["example"]},
+                "not_charged": unbilled})
+        return JSONResponse(status_code=422, content={
+            "error": f"missing required field(s): {', '.join(missing)}",
+            "code": "missing_required_field", "endpoint": endpoint,
+            "required": list(svc.required),
+            "example_request": {"input": contract["example"]},
+            "not_charged": unbilled})
+
     payment = verify_payment(authorization, SETTINGS, endpoint=endpoint,
                              fee_usdt=_price(endpoint))
     if not payment.ok:
@@ -306,37 +351,6 @@ async def paid_endpoint(endpoint: str, request: Request,
         # onto a longer body, so uvicorn truncated the socket and the caller saw "empty reply from
         # server" on the one path where a reason matters most.
         return _challenge_response(endpoint, {"payment_error": payment.detail}, payment.code)
-
-    try:
-        payload = await request.json()
-    except Exception:                                                # noqa: BLE001
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    node_input = payload.get("input") if isinstance(payload.get("input"), dict) else payload
-    node_input = {k: v for k, v in node_input.items() if k not in ("options", "idempotency_key")}
-
-    # Payment has already settled by the time this runs. A paid call that arrives empty gets the
-    # contract at 200 rather than an error — answering "you forgot the symbol" and keeping the money
-    # is charging for nothing.
-    missing = [f for f in svc.required if node_input.get(f) in (None, "")]
-    if missing and not node_input:
-        contract = svc.input_contract()
-        return JSONResponse(status_code=200, headers=_headers_for(payment), content={
-            "endpoint": endpoint, "status": "input_required",
-            "what_this_does": svc.summary, "returns": svc.returns, "depth": svc.depth,
-            "required": contract["required"], "properties": contract["properties"],
-            "example_request": {"input": contract["example"]},
-            "note": ("Your payment settled before this call reached us, so rather than return an "
-                     "error this is the contract for the endpoint. Send the example above to get "
-                     "the real result."),
-        })
-    if missing:
-        return JSONResponse(status_code=422, headers=_headers_for(payment), content={
-            "error": f"missing required field(s): {', '.join(missing)}",
-            "code": "missing_required_field", "endpoint": endpoint,
-            "required": list(svc.required),
-            "example_request": {"input": svc.input_contract()["example"]}})
 
     notes: list[str] = []
     try:

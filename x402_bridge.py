@@ -120,6 +120,46 @@ class PaymentResult:
         self.tx = tx
 
 
+def malformed_payment(header_value: str) -> PaymentResult | None:
+    """Decode-only check: is this header unreadable? Returns None when it parses.
+
+    Split out from `verify_payment` so the caller can reject a broken header *before* validating the
+    request body. Both checks have to happen before settlement, and their order matters: a client
+    that sent an unreadable header and an incomplete body has two bugs, and being told "your header
+    is malformed" is the one that explains why paying again will not help.
+    """
+    name = "PAYMENT-SIGNATURE"
+    raw = (header_value or "").strip()
+    if not raw:
+        return PaymentResult(False, f"the {name} header was empty.",
+                             code="malformed_payment_signature", field=name, malformed=True)
+    try:
+        decoded = base64.b64decode(raw, validate=False)
+    except Exception as e:                                               # noqa: BLE001
+        return PaymentResult(
+            False, f"the {name} header is not valid base64 ({e}). It must be the base64 encoding of "
+                   f"the x402 v2 payment payload your wallet returns.",
+            code="malformed_payment_signature", field=name, malformed=True)
+    try:
+        payload = json.loads(decoded)
+    except Exception as e:                                               # noqa: BLE001
+        return PaymentResult(
+            False, f"the {name} header decoded, but not to JSON ({e}). Expected a JSON object with "
+                   f"'x402Version', 'accepted' and 'payload'.",
+            code="malformed_payment_signature", field=name, malformed=True)
+    if not isinstance(payload, dict):
+        return PaymentResult(
+            False, f"the {name} header decoded to {type(payload).__name__}, not a JSON object.",
+            code="malformed_payment_signature", field=name, malformed=True)
+    inner = payload.get("payload")
+    if not (isinstance(inner, dict) and "authorization" in inner) and not payload.get("nonce"):
+        return PaymentResult(
+            False, f"the {name} header decoded to JSON with neither an x402 v2 "
+                   f"'payload.authorization' nor a challenge 'nonce'.",
+            code="malformed_payment_signature", field=name, malformed=True)
+    return None
+
+
 def verify_payment(header_value: str, settings: Settings, endpoint: str = "",
                    fee_usdt: str = "") -> PaymentResult:
     """Verify an authorization and, in facilitator mode, settle it on X Layer."""
