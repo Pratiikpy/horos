@@ -361,6 +361,34 @@ async def paid_endpoint(endpoint: str, request: Request,
         return _challenge_response(endpoint, {"payment_error": payment.detail}, payment.code)
 
     notes: list[str] = []
+
+    # Say so when part of the request was not understood.
+    #
+    # An unrecognised key was silently dropped and the declared default used instead, so a caller who
+    # typed `exchagnes` asked for two venues, paid, and received five computed from defaults with
+    # nothing indicating their input had been ignored. Measured on the live service. The same slip on
+    # `horizon` or `max_age_seconds` returns a confident answer to a different question, which is the
+    # kind a buyer acts on.
+    #
+    # This warns rather than refuses. Refusing would be cheaper for the caller, but it would also
+    # reject any client that sends an extra field today, and breaking a working integration to
+    # prevent a typo is the wrong trade on a listed service. The note travels inside the signed
+    # envelope, so it cannot be stripped from the answer it qualifies.
+    declared = {p.name for p in svc.params}
+    unknown = sorted(set(node_input) - declared)
+    if unknown:
+        import difflib
+        hints = []
+        for key in unknown:
+            near = difflib.get_close_matches(key, sorted(declared), n=1, cutoff=0.7)
+            hints.append(f"{key!r}" + (f" (did you mean {near[0]!r}?)" if near else ""))
+        notes.append(
+            "Ignored, because this endpoint does not accept " + ("them: " if len(unknown) > 1
+                                                                 else "it: ")
+            + ", ".join(hints)
+            + ". The declared default was used instead, so this answer may not be the one you "
+              "intended. Accepted fields: " + ", ".join(sorted(declared)) + ".")
+
     try:
         output = svc.handler(node_input, CTX)
     except ServiceError as e:
