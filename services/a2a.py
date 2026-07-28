@@ -241,7 +241,7 @@ def analysis_task(inp: dict, ctx) -> dict:
     # brief is checked against, so rewriting characters inside it would break that correspondence.
     brief = to_ascii_punctuation(brief)
 
-    return {
+    payload = {
         "request": request,
         "understanding": plan.get("understanding"),
         "plan": [{"endpoint": s.get("endpoint"), "why": s.get("why")}
@@ -261,3 +261,22 @@ def analysis_task(inp: dict, ctx) -> dict:
         "not_advice": ("Horos measures and forecasts with uncertainty attached. It does not tell you "
                        "whether to trade, and publishes no directional view."),
     }
+
+    # Every prose field, not just the brief.
+    #
+    # Normalising `brief` alone was half a fix, and the half that was missing reached a customer. A
+    # delivered A2A artifact came back reading `periods â€" described as ordinary`: the em-dash in
+    # `models.role` — a fixed string in this very file — encoded to UTF-8, decoded again as cp1252
+    # somewhere in the marketplace's compose-and-write step, and re-encoded. The bytes in the
+    # delivered file are `C3 A2 E2 82 AC E2 80 9D` and no real em-dash survives, which is what makes
+    # it double-encoding rather than a display problem at our end.
+    #
+    # That step is not ours to fix and it corrupts any non-ASCII character we hand it. What is ours
+    # is not handing it any. So every string the buyer reads as prose is normalised, and
+    # `raw_results` is still left exactly as the services produced it — the brief is checked against
+    # it, and rewriting characters inside it would break that correspondence, which was the right
+    # call and stays.
+    raw = payload.pop("raw_results")
+    payload = to_ascii_punctuation(payload)
+    payload["raw_results"] = raw
+    return payload
