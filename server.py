@@ -19,7 +19,9 @@ an error, because charging for "you forgot the symbol" is charging for nothing.
 """
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import logging
 import time
 from typing import Any
@@ -55,6 +57,8 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 
 SETTINGS = get_settings()
+# Set only in this host's environment. Empty means the internal door does not exist.
+_INTERNAL_SECRET = os.environ.get("HOROS_INTERNAL_SECRET", "").strip()
 REGISTRY.validate()          # a catalogue unfit to list must fail at import, not at review
 
 _LEDGER = Ledger(SETTINGS.ledger_path, Signer(SETTINGS.signing_key_path))
@@ -248,7 +252,13 @@ def verify_instructions() -> dict:
 # ── the paid surface ─────────────────────────────────────────────────────────────────────────────
 
 def _headers_for(payment) -> dict:
-    return {PAYMENT_RESPONSE_HEADER: payment.response_header} if payment.response_header else {}
+    """The settlement receipt header, when the facilitator returned one.
+
+    `payment` is None on the internal path, where the daemon was already paid through escrow and
+    nothing settles here, so there is no receipt to echo."""
+    if payment is None or not payment.response_header:
+        return {}
+    return {PAYMENT_RESPONSE_HEADER: payment.response_header}
 
 
 def _challenge_response(endpoint: str, extra: dict | None = None, code: str = "") -> Response:
@@ -268,7 +278,8 @@ def _challenge_response(endpoint: str, extra: dict | None = None, code: str = ""
                methods=["GET", "POST", "PUT", "PATCH", "HEAD", "OPTIONS", "DELETE"])
 async def paid_endpoint(endpoint: str, request: Request,
                         x_payment: str | None = Header(default=None),
-                        payment_signature: str | None = Header(default=None)) -> Response:
+                        payment_signature: str | None = Header(default=None),
+                        x_horos_internal: str | None = Header(default=None)) -> Response:
     started = time.time()
     svc = REGISTRY.get(endpoint)
     if svc is None:
@@ -285,12 +296,25 @@ async def paid_endpoint(endpoint: str, request: Request,
     # challenge. A header that is present but empty is a client that built the request wrong; paying
     # again will not fix it, so it gets a typed 400 naming the field, the same as any other
     # unparseable header.
+    # The A2A daemon has already been paid for this job through the marketplace's escrow, and it
+    # calls this engine to produce the deliverable. Without a way in it would have to pay a second
+    # time for work the customer bought once — which is why the shared wrapper answered every Horos
+    # A2A customer as a different agent instead: it had no route here at all.
+    #
+    # A constant-time comparison against a secret that lives only in this host's environment. Never
+    # an Origin or Sec-Fetch-Site check: any HTTP client can forge those, and that would hand the
+    # OKX validator a paid result for free and fail x402 review. No secret set, no door.
+    _internal = (x_horos_internal or "").strip()
+    internal_ok = (bool(_INTERNAL_SECRET)
+                   and len(_internal) == len(_INTERNAL_SECRET)
+                   and hmac.compare_digest(_internal, _INTERNAL_SECRET))
+
     supplied = [h for h in (payment_signature, x_payment) if h is not None]
-    if not supplied:
+    if not supplied and not internal_ok:
         # No body is read at all on this path.
         return _challenge_response(endpoint)
     authorization = next((h for h in supplied if h.strip()), "")
-    if not authorization:
+    if not authorization and not internal_ok:
         return JSONResponse(status_code=400, content={
             "error": "the PAYMENT-SIGNATURE header was present but empty.",
             "code": "malformed_payment_signature", "field": "PAYMENT-SIGNATURE",
@@ -301,7 +325,7 @@ async def paid_endpoint(endpoint: str, request: Request,
     # An unreadable header is answered first. A caller with both a broken header and a thin body has
     # two problems, and "your header is malformed" is the one that explains why retrying the payment
     # will not help — so it must not be masked by the input check below.
-    broken = malformed_payment(authorization)
+    broken = None if internal_ok else malformed_payment(authorization)
     if broken is not None:
         return JSONResponse(status_code=400, content={
             "error": broken.detail, "code": broken.code, "field": broken.field,
@@ -343,9 +367,9 @@ async def paid_endpoint(endpoint: str, request: Request,
             "example_request": {"input": contract["example"]},
             "not_charged": unbilled})
 
-    payment = verify_payment(authorization, SETTINGS, endpoint=endpoint,
-                             fee_usdt=_price(endpoint))
-    if not payment.ok:
+    payment = None if internal_ok else verify_payment(
+        authorization, SETTINGS, endpoint=endpoint, fee_usdt=_price(endpoint))
+    if payment is not None and not payment.ok:
         if payment.malformed:
             # The caller's bug, not a payment problem — paying again changes nothing, so a typed 400
             # naming the field rather than a challenge that invites a pointless retry.
@@ -420,8 +444,15 @@ async def paid_endpoint(endpoint: str, request: Request,
             "note": "this is a defect in Horos, not in your request. The failure is reported "
                     "rather than disguised as an empty result."})
 
-    if payment.tx:
+    if payment is not None and payment.tx:
         notes.append(f"settled on {SETTINGS.x402_network}, transaction {payment.tx}")
+    elif payment is None:
+        # The internal path. Saying so in the envelope keeps the note honest: this deliverable was
+        # produced for an A2A job already paid through the marketplace's escrow, so there is no
+        # x402 settlement transaction to point at, and claiming one would be a lie in a signed
+        # artifact.
+        notes.append("produced for an A2A job settled through the marketplace escrow, so there is "
+                     "no separate x402 transaction for this call")
 
     env = envelope(svc, node_input, output, _LEDGER.signer, notes=notes, started=started)
     return JSONResponse(status_code=200, headers=_headers_for(payment), content=env)

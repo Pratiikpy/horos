@@ -320,3 +320,36 @@ def test_the_published_verify_steps_actually_rebuild_the_manifest(client):
     assert Signer.verify(env["receipt"]["manifest_sha256"], env["receipt"]["signature"],
                          env["receipt"]["public_key"])
     assert env["receipt"]["public_key"] == steps["public_key_ed25519"]
+
+
+def test_the_internal_door_never_widens_the_paid_one():
+    """The A2A daemon is already paid through escrow and needs a route to this engine that does not
+    charge twice. Without one the shared wrapper had no way to reach Horos and answered every Horos
+    A2A customer as a different agent.
+
+    The door must be a secret comparison and nothing weaker. An Origin or Sec-Fetch-Site check is
+    forgeable by any HTTP client, which would hand the OKX validator a paid result for free and fail
+    x402 review — so the listing depends on this staying exact.
+    """
+    import hmac
+
+    for secret, presented, expected in [
+        ("", "anything", False),          # no secret configured: the door does not exist
+        ("s3cret", "", False),            # nothing presented
+        ("s3cret", "s3cre", False),       # wrong length
+        ("s3cret", "s3crfa", False),      # right length, wrong value
+        ("s3cret", "s3cret", True),       # exact match
+    ]:
+        ok = (bool(secret) and len(presented) == len(secret)
+              and hmac.compare_digest(presented, secret))
+        assert ok is expected, f"{secret!r} vs {presented!r}"
+
+
+def test_a_bare_probe_still_gets_a_challenge_with_no_secret_set(client):
+    """The listing validator probes with no body and no payment. That must still be a 402 carrying a
+    challenge, exactly as before the internal door existed."""
+    import server
+    server._INTERNAL_SECRET = ""
+    r = client.post(PAID, json={})
+    assert r.status_code == 402
+    assert PAYMENT_REQUIRED_HEADER in r.headers
