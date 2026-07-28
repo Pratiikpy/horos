@@ -31,6 +31,27 @@ from .registry import Param, ServiceError, service
 HEX64 = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
 
 
+def _grid_label(horizon: str) -> str:
+    """What the caller's window has to line up with. Always hourly: every horizon is a whole number
+    of 1h candles and the outcome is read from 1h candles, so the boundary is the top of the hour."""
+    return "hourly candle"
+
+
+def _snap_to_candle_grid(close_iso: str, horizon: str = "1h") -> tuple[str, bool]:
+    """Move a window close forward to the next hour boundary, if it is not already on one.
+
+    Returns the effective close and whether it moved. Forward, never back: moving it back could
+    place the close in the past and convert an honest commitment into a backdated one, which is
+    the one thing this ledger exists to make impossible.
+    """
+    from datetime import datetime, timedelta, timezone
+    dt = datetime.strptime(close_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    if dt.minute == 0 and dt.second == 0:
+        return close_iso, False
+    snapped = (dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    return snapped.strftime("%Y-%m-%dT%H:%M:%SZ"), True
+
+
 def _scored_rows(ctx, symbol: str | None = None, horizon: str | None = None,
                  model: str | None = None) -> list[dict]:
     """Every scored forecast, joined back to what was issued. Voided entries are excluded."""
@@ -442,17 +463,42 @@ def commit(inp: dict, ctx) -> dict:
             f"own window has closed proves nothing, so it is refused rather than recorded.",
             code="window_already_closed")
 
+    # Snap the close up to a candle boundary, and say so.
+    #
+    # The outcome is measured from exchange candles, so a window that does not land on the grid has
+    # no candles to measure. Committing "BTC in one hour" at 14:23 — the most natural thing a
+    # forecaster can do — produced a window of 14:23 to 15:23, which `commit` accepted without a
+    # word. The forecaster then paid for `judge` after the close and got
+    # `no 1h candles between 14:23 and 15:23`: a dead end, reached only once both fees were spent
+    # and the window could no longer be changed.
+    #
+    # Snapping up rather than down, because down could move the close into the past and turn an
+    # honest commitment into a backdated one. Both the requested and the effective time are
+    # returned; nothing is silently reinterpreted, and the digest is unaffected since it covers the
+    # forecast, not the window.
+    horizon = str(inp.get("horizon", "1h"))
+    close_effective, snapped = _snap_to_candle_grid(close, horizon)
+
     entry = ctx.ledger.append("third_party_commit", {
         "forecast_id": f"tp:{digest[:24]}",
-        "digest": digest, "symbol": symbol, "horizon": str(inp.get("horizon", "1h")),
-        "label": label, "window_close": close, "note": inp.get("note"),
+        "digest": digest, "symbol": symbol, "horizon": horizon,
+        "label": label, "window_close": close_effective,
+        "window_close_requested": close if snapped else None,
+        "note": inp.get("note"),
         "committed_at": now,
     })
     ctx.invalidate()
     return {
         "committed": True,
         "commitment_id": entry.body["forecast_id"],
-        "digest": digest, "symbol": symbol, "window_close": close, "label": label,
+        "digest": digest, "symbol": symbol, "window_close": close_effective, "label": label,
+        **({"window_close_requested": close,
+            "window_note": (
+                f"You asked for {close}. Outcomes are measured from exchange candles, and that time "
+                f"is not on the {_grid_label(horizon)} grid, so nothing could be scored against it. "
+                f"The window was moved forward to the next boundary, {close_effective}, which is "
+                f"the first moment a complete candle covers your forecast. Call `judge` after "
+                f"that.")} if snapped else {}),
         "ledger": {"seq": entry.seq, "entry_hash": entry.hash, "chain_head": ctx.ledger.head()},
         "anchoring": ("this entry joins the hash chain immediately and its head is committed to "
                       "X Layer on the next anchor, which runs at least every 15 minutes and "
@@ -539,14 +585,37 @@ def judge(inp: dict, ctx) -> dict:
     steps = HORIZONS.get(horizon, 1)
     step_s = TIMEFRAME_SECONDS["1h"]
     from datetime import datetime, timedelta, timezone
-    close_dt = datetime.strptime(record["window_close"], "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc)
+
+    # Commitments written before `commit` started snapping can still carry an off-grid close, and
+    # those are exactly the ones that cannot be scored: the outcome comes from hourly candles, and
+    # a window of 14:23 to 15:23 contains no whole candle. Aligning here means an existing
+    # commitment is still worth what its holder paid for, instead of being permanently unscoreable
+    # through no fault of theirs. New ones arrive already aligned and this is a no-op.
+    scored_close, realigned = _snap_to_candle_grid(record["window_close"], horizon)
+    if realigned and scored_close > now:
+        return {
+            "commitment_id": cid, "label": record["label"], "symbol": record["symbol"],
+            "horizon": horizon,
+            "status": "not_yet_scoreable",
+            "digest_verified": True,
+            "committed_at": record["committed_at"],
+            "window_close": record["window_close"],
+            "window_close_scored": scored_close,
+            "now": now,
+            "reason": (f"this commitment's window closes at {record['window_close']}, which is not "
+                       f"on the hourly candle grid the outcome is measured from. The first complete "
+                       f"candle covering it closes at {scored_close}, and it is {now}."),
+            "next_step": f"call judge again with the same commitment_id and forecast after {scored_close}.",
+        }
+
+    close_dt = datetime.strptime(scored_close, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     open_iso = (close_dt - timedelta(seconds=step_s * steps)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
-        actual = ctx.data.window_outcome(record["symbol"], "1h", open_iso, record["window_close"])
+        actual = ctx.data.window_outcome(record["symbol"], "1h", open_iso, scored_close)
     except MarketDataError as e:
-        raise ServiceError(f"the outcome could not be fetched: {e}", code=e.code) from e
+        raise ServiceError(
+            f"the outcome could not be fetched: {e}", code=e.code) from e
 
     baseline = None
     anchor = revealed.get("anchor_price")
@@ -577,7 +646,14 @@ def judge(inp: dict, ctx) -> dict:
         "horizon": horizon,
         "digest_verified": True,
         "committed_at": record["committed_at"],
-        "window": {"open": open_iso, "close": record["window_close"]},
+        # Both times, always. The interval scored is the one the outcome was actually read over,
+        # and a caller comparing it against what they committed must be able to see any difference
+        # rather than having to infer it.
+        "window": {"open": open_iso, "close": scored_close,
+                   "requested_close": record["window_close"],
+                   **({"note": "Your window did not land on the hourly candle grid the outcome is "
+                               "measured from, so it was scored over the first complete candle "
+                               "covering it."} if realigned else {})},
         "actual": actual,
         "scores": scores,
         "scorer_version": SCORER_VERSION,
