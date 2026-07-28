@@ -285,3 +285,38 @@ def test_the_chain_verifies_over_http(client):
     r = client.get("/ledger/verify")
     assert r.status_code == 200
     assert r.json()["verified"] is True, r.json()["problems"]
+
+
+def test_the_published_verify_steps_actually_rebuild_the_manifest(client):
+    """/verify tells a buyer the six manifest fields are "echoed in every response, so the manifest
+    can be rebuilt from the response alone". That sentence was false: `tool` was signed but never
+    echoed, so anyone following the steps hashed `tool: null`, got a different digest, and concluded
+    the receipt was bad — on every service, every time. Caught by re-implementing the instructions
+    from scratch rather than by reading them.
+
+    This rebuilds the manifest exactly as the page says to, from the envelope alone.
+    """
+    import hashlib
+    import json
+
+    steps = client.get("/verify").json()
+    fields = steps["manifest"]["fields"]
+
+    ch = decode_challenge(client.post(PAID, json={}).headers[PAYMENT_REQUIRED_HEADER])
+    env = client.post(PAID, json={"input": {"symbol": "BTC/USDT:USDT", "horizon": "1h"}},
+                      headers={"PAYMENT-SIGNATURE": make_dev_payment(ch)}).json()
+
+    for f in fields:
+        assert f in env, f"/verify says {f!r} is echoed in every response, and it is not"
+
+    rebuilt = {f: env[f] for f in fields}
+    recomputed = "sha256:" + hashlib.sha256(
+        json.dumps(rebuilt, sort_keys=True, separators=(",", ":"),
+                   ensure_ascii=False).encode("utf-8")).hexdigest()
+    assert recomputed == env["receipt"]["manifest_sha256"], (
+        "following the published instructions does not reproduce the receipt")
+
+    from core.crypto import Signer
+    assert Signer.verify(env["receipt"]["manifest_sha256"], env["receipt"]["signature"],
+                         env["receipt"]["public_key"])
+    assert env["receipt"]["public_key"] == steps["public_key_ed25519"]

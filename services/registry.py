@@ -207,6 +207,16 @@ def envelope(service: Service, request_input: dict, output: dict, signer,
         "service": "Horos",
         "endpoint": service.endpoint,
         "title": service.title,
+        # Echoed because the receipt is signed over it and /verify tells buyers to rebuild the
+        # manifest from the response. Five of the six fields were echoed and this one was not, so
+        # anyone following the published steps hashed `tool: null`, got a different digest, and
+        # concluded the receipt was bad — on every service, every time. Verified by re-implementing
+        # the instructions from scratch: rebuilt sha256:c60c85c3… against a claimed
+        # sha256:2d200394…, and the only difference was this field.
+        #
+        # The signature scheme is untouched. The manifest always contained `tool`; it simply was not
+        # visible. Receipts issued before this change verify exactly as before.
+        "tool": manifest["tool"],
         "job_id": job_id,
         "issued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "elapsed_seconds": round(time.time() - started, 3) if started else None,
